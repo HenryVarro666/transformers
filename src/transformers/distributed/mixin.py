@@ -28,13 +28,13 @@ from ..utils import SAFE_WEIGHTS_INDEX_NAME, is_torch_available, is_torch_greate
 from ..utils.hub import create_and_tag_model_card
 from .configuration_utils import DistributedConfig
 from .fsdp import is_fsdp_managed_module
-from .pipeline_parallel import initialize_pipeline_parallelism
 from .utils import (
     _get_torch_distributed_rank,
     _is_torch_distributed_initialized,
     distribute_model,
     gather_full_state_dict,
     initialize_fully_sharded_data_parallelism,
+    initialize_pipeline_parallelism,
     save_model_checkpoint_distributed,
 )
 

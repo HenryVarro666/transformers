@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from ..integrations.tensor_parallel import apply_tensor_parallelism
 from ..utils import is_torch_available, is_torch_greater_or_equal
 from .fsdp import apply_fully_sharded_data_parallelism
+from .pipeline_parallel import apply_pipeline_parallelism
 
 
 if TYPE_CHECKING:
@@ -153,6 +154,34 @@ def initialize_fully_sharded_data_parallelism(distributed_config: DistributedCon
     return device_map, mesh
 
 
+def initialize_pipeline_parallelism(
+    distributed_config: DistributedConfig,
+):
+    if not is_torch_greater_or_equal("2.5"):
+        raise OSError("Pipeline parallelism with DistributedConfig requires `torch>=2.5`.")
+
+    device_type = torch._C._get_accelerator().type
+    _ensure_torch_distributed(device_type)
+
+    world_size = torch.distributed.get_world_size()
+    pp_size = distributed_config.pp_size
+    if world_size != pp_size:
+        raise RuntimeError(f"world_size ({world_size}) must be equal to pp_size ({pp_size})")
+
+    if device_type != "cpu":
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        getattr(torch, device_type).set_device(local_rank)
+        device_map = torch.device(device_type, local_rank)
+    else:
+        device_map = torch.device(device_type)
+    
+
+    assert world_size == pp_size, f"world_size ({world_size}) must be equal to pp_size ({pp_size})"
+    mesh = torch.distributed.init_device_mesh(device_type, (pp_size,), mesh_dim_names=("pp",))
+
+    return device_map, mesh
+
+
 def distribute_model(
     model,
     distributed_config: DistributedConfig,
@@ -172,6 +201,9 @@ def distribute_model(
     elif distributed_config.fsdp_size > 1:
         fsdp_mesh = device_mesh["fsdp"] if device_mesh.ndim > 1 else device_mesh
         model = apply_fully_sharded_data_parallelism(model, fsdp_mesh)
+    elif distributed_config.pp_size > 1:
+        pp_mesh = device_mesh["pp"] if device_mesh.ndim > 1 else device_mesh
+        model = apply_pipeline_parallelism(model, pp_mesh)
 
     return model
 
