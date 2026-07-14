@@ -416,7 +416,7 @@ class ImageTextToTextPipeline(Pipeline):
 
         # Decode inputs and outputs the same way to remove input text from generated text if present
         skip_special_tokens = skip_special_tokens if skip_special_tokens is not None else True
-        if getattr(self.tokenizer, "response_template", None) or getattr(self.tokenizer, "response_schema", None):
+        if getattr(self.tokenizer, "response_template", None):
             skip_special_tokens = False
         generated_texts = self.processor.post_process_image_text_to_text(
             generated_sequence, skip_special_tokens=skip_special_tokens, **postprocess_kwargs
@@ -467,9 +467,6 @@ class ImageTextToTextPipeline(Pipeline):
                             # templates often pre-write part of the assistant message (e.g. an
                             # opening <think> tag), which affects parsing.
                             assistant_message = self.tokenizer.parse_response(generated_text, prefix=decoded_input)
-                        elif getattr(self.tokenizer, "response_schema", None) is not None:
-                            # Legacy schemas parse the generated text alone and don't support `prefix`
-                            assistant_message = self.tokenizer.parse_response(generated_text)
                         else:
                             assistant_message = {"role": "assistant", "content": generated_text}
                         generated_text = list(prompt_text.messages) + [assistant_message]

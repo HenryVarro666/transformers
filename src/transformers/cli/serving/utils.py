@@ -127,16 +127,19 @@ _TOOL_CALL_FALLBACKS = {
         "stc": "<tool_call>",
         "etc": "</tool_call>",
         "schema": {
-            "x-regex-iterator": r"<function=(?P<name>[^>\n]+)>(?P<arguments>.*?)</function>",
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "arguments": {
-                        "type": "object",
-                        "x-regex-key-value": r"<parameter=(?P<key>[^>\n]+)>\s*(?P<value>.*?)\s*</parameter>",
+            "defaults": {},
+            "start_anchor": "<|im_start|>assistant\n",
+            "fields": {
+                "tool_calls": {
+                    "open_pattern": r"<tool_call>\s*<function=(?P<name>\w+)>",
+                    "close": "</tool_call>",
+                    "repeats": True,
+                    "content": "xml-inline",
+                    "content_args": {
+                        "tag_pattern": r"<parameter=(?P<key>\w+)>\s*(?P<value>.*?)\s*</parameter>",
+                        "value_parser": {"name": "json", "args": {"allow_non_json": True}},
                     },
+                    "transform": {"type": "function", "function": {"name": "{name}", "arguments": "{content}"}},
                 },
             },
         },
@@ -156,10 +159,9 @@ def get_tool_call_config(processor, model: "PreTrainedModel") -> dict | None:
     stc = getattr(tokenizer, "stc_token", None)
     etc = getattr(tokenizer, "etc_token", None)
     response_template = getattr(tokenizer, "response_template", None)
-    response_schema = getattr(tokenizer, "response_schema", None)
 
     schema: dict | None = None
-    # Prefer the new-style response_template (e.g. Gemma 4).
+    # Prefer the tokenizer's own response_template (e.g. Gemma 4).
     if stc and etc and response_template and "tool_calls" in response_template.get("fields", {}):
         schema = {
             "defaults": {},
@@ -170,9 +172,6 @@ def get_tool_call_config(processor, model: "PreTrainedModel") -> dict | None:
             if anchor_key in response_template:
                 schema[anchor_key] = response_template[anchor_key]
                 break
-    # Legacy response_schema path (still supported for old tokenizers).
-    elif stc and etc and response_schema:
-        schema = response_schema["properties"]["tool_calls"]
     else:
         # Fallback: known model families without full tokenizer config. Matched by exact
         # model_type against the tuple keys of _TOOL_CALL_FALLBACKS.
@@ -212,7 +211,7 @@ def parse_tool_calls(processor, generated_ids, schema: dict) -> list[dict] | Non
         generated_ids: Token IDs from generation. Passed directly to ``parse_response``
             which decodes them internally, preserving special tokens that
             ``skip_special_tokens=True`` would strip (e.g. Gemma's ``<|tool_call>``).
-        schema: The tool call schema (from ``response_schema`` or ``_TOOL_CALL_FALLBACKS``).
+        schema: The tool call schema (from the tokenizer's ``response_template`` or ``_TOOL_CALL_FALLBACKS``).
 
     Returns a list of ``{"name": str, "arguments": str}`` dicts, or ``None`` if none found.
     """
@@ -228,30 +227,13 @@ def parse_tool_calls(processor, generated_ids, schema: dict) -> list[dict] | Non
     return tool_calls if tool_calls else None
 
 
-# Default start/end tokens + schema. The opening token is optional so prefilled
-# ``<think>`` prompts still match.
-_DEFAULT_THINKING_TOKENS = {
-    "start": ["<think>"],
-    "end": "</think>",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "thinking": {"type": "string"},
-            "content": {"type": "string"},
-        },
-        # Trailing ``(?:<\|...\|>)?\Z`` absorbs EOS markers (``<|im_end|>``,
-        # ``<|endoftext|>``, ``<|eot_id|>``) that would otherwise be captured by the
-        # content group, since ``parse_response`` decodes with ``skip_special_tokens=False``.
-        "x-regex": r"(?:<think>)?(?P<thinking>.*?)</think>(?P<content>.*?)(?:<\|[^|<>\s]+\|>)?\Z",
-    },
-}
-# Streaming-side token IDs for families whose ``response_schema`` uses non-default
-# start/end tokens. Post-hoc parsing uses the schema; this only feeds the
-# streamer's token-level detector.
+# Default thinking-block delimiter tokens. Feeds both the streamer's token-level detector and the
+# post-hoc ``response_template`` built by ``get_reasoning_config`` (via the decoded token strings).
+_DEFAULT_THINKING_TOKENS = {"start": ["<think>"], "end": "</think>"}
+# Token sequences for families whose thinking block uses non-default delimiters.
 _THINKING_TOKENS = {
-    # Gemma 4's response_schema regex anchors on the literal ``<|channel>thought\n``,
-    # consuming the newline before the thinking capture begins. Include ``\n`` in the
-    # streamer's start sequence so it's suppressed the same way.
+    # Gemma 4 wraps its thinking block in ``<|channel>thought\n`` ... ``<channel|>``. The ``\n`` is
+    # part of the opener so the streamer suppresses it along with the delimiter tokens.
     "gemma4": {"start": ["<|channel>", "thought", "\n"], "end": "<channel|>"},
 }
 
@@ -260,11 +242,13 @@ def get_reasoning_config(processor, model: "PreTrainedModel", input_ids=None) ->
     """Return reasoning config for the model, or ``None`` if not supported.
 
     The config drives both streaming detection (token IDs) and post-hoc parsing
-    (response schema). Returns a dict with:
+    (a ``response_template``). Returns a dict with:
         - ``start_ids`` (`list[int]`): Token ID sequence that opens a thinking block.
         - ``end_id`` (`int`): Token ID that closes the block.
-        - ``schema`` (`dict`): Response schema with ``thinking`` / ``content``
-          properties for :func:`parse_reasoning`.
+        - ``template`` (`dict`): ``response_template`` with ``thinking`` / ``content``
+          fields for :func:`parse_reasoning`.
+        - ``open_token`` (`str`): The thinking opener, seeded as the parse ``prefix`` when the
+          prompt prefilled it (see :func:`parse_reasoning`).
         - ``start_in_thinking`` (`bool`, only when ``input_ids`` is given): Whether
           the rendered prompt already opened an unclosed thinking block (prefilled
           by the template), so the model's output begins inside the block.
@@ -279,12 +263,19 @@ def get_reasoning_config(processor, model: "PreTrainedModel", input_ids=None) ->
     end_id = tokenizer.convert_tokens_to_ids(thinking_tokens["end"])
     if any(tid in (None, tokenizer.unk_token_id) for tid in start_ids) or end_id in (None, tokenizer.unk_token_id):
         return None
-    # Custom-token families (e.g. Gemma 4) provide their schema via the tokenizer;
-    # default ``<think>`` falls back to the schema baked into ``_DEFAULT_THINKING_TOKENS``.
-    schema = getattr(tokenizer, "response_schema", None)
-    if not (schema and "thinking" in schema["properties"]):
-        schema = _DEFAULT_THINKING_TOKENS["schema"]
-    config: dict = {"start_ids": start_ids, "end_id": end_id, "schema": schema}
+    open_token = "".join(thinking_tokens["start"])
+    template = {
+        "version": 1,
+        "defaults": {},
+        # `parse_reasoning` parses the model output alone (no chat history), so there is nothing to
+        # truncate; `\A` matches at position 0 so the opener we seed as `prefix` is processed in full.
+        "start_anchor_pattern": r"\A",
+        "fields": {
+            "thinking": {"open": open_token, "close": thinking_tokens["end"], "content": "text"},
+            "content": {"content": "text"},
+        },
+    }
+    config: dict = {"start_ids": start_ids, "end_id": end_id, "template": template, "open_token": open_token}
     if input_ids is not None:
         config["start_in_thinking"] = _starts_in_thinking(input_ids, start_ids)
     return config
@@ -293,20 +284,16 @@ def get_reasoning_config(processor, model: "PreTrainedModel", input_ids=None) ->
 def parse_reasoning(processor, generated_ids, content: str, reasoning_config: dict) -> tuple[str, str | None]:
     """Split generated output into ``(content, reasoning_content)`` via ``parse_response``.
 
-    If the schema's regex matches (closing marker present), use it. For prompts
-    that prefill the opener (QwQ-32B, DeepSeek-R1) the entire output is reasoning
-    until ``</think>`` arrives — when that's truncated, fall back to treating
-    all decoded text as reasoning. Returns ``(content, None)`` otherwise.
+    Parses the output against the reasoning ``response_template``. When the prompt prefilled the
+    opener (QwQ-32B, DeepSeek-R1) the model resumes *inside* the block, so we seed the parser with
+    the opener as ``prefix`` — this handles both a normally-closed block and one truncated before
+    the closer. Returns ``(content, None)`` when no thinking block is found.
     """
-    parsed = processor.parse_response(generated_ids, reasoning_config["schema"])
-    if parsed:
-        reasoning = parsed.get("thinking", "")
-        if reasoning:
-            return parsed.get("content", ""), reasoning
-    # Prefilled opener (QwQ-32B, DeepSeek-R1) truncated before ``</think>`` —
-    # no anchor for the schema regex; treat all output as reasoning.
-    if reasoning_config.get("start_in_thinking"):
-        return "", content
+    prefix = reasoning_config["open_token"] if reasoning_config.get("start_in_thinking") else ""
+    parsed = processor.parse_response(generated_ids, reasoning_config["template"], prefix=prefix)
+    reasoning = parsed.get("thinking", "") if parsed else ""
+    if reasoning:
+        return parsed.get("content", ""), reasoning
     return content, None
 
 
