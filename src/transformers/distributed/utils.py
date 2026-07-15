@@ -174,7 +174,6 @@ def initialize_pipeline_parallelism(
         device_map = torch.device(device_type, local_rank)
     else:
         device_map = torch.device(device_type)
-    
 
     assert world_size == pp_size, f"world_size ({world_size}) must be equal to pp_size ({pp_size})"
     mesh = torch.distributed.init_device_mesh(device_type, (pp_size,), mesh_dim_names=("pp",))
